@@ -375,7 +375,7 @@ func (e *IndexReaderExecutor) open(ctx context.Context, kvRanges []kv.KeyRange) 
 			}
 			results = append(results, result)
 		}
-		e.result = distsql.NewSortedSelectResults(results, e.Schema(), e.byItems, e.memTracker)
+		e.result = distsql.NewSortedSelectResults(e.Ctx().GetExprCtx().GetEvalCtx(), results, e.Schema(), e.byItems, e.memTracker)
 	}
 	return nil
 }
@@ -542,7 +542,11 @@ func (e *IndexLookUpExecutor) open(_ context.Context) error {
 	// constructed by a "IndexLookUpJoin" and "Open" will not be called in that
 	// situation.
 	e.initRuntimeStats()
-	e.memTracker = memory.NewTracker(e.ID(), -1)
+	if e.memTracker != nil {
+		e.memTracker.Reset()
+	} else {
+		e.memTracker = memory.NewTracker(e.ID(), -1)
+	}
 	e.memTracker.AttachTo(e.Ctx().GetSessionVars().StmtCtx.MemTracker)
 
 	e.finished = make(chan struct{})
@@ -581,30 +585,27 @@ func (e *IndexLookUpExecutor) startWorkers(ctx context.Context, initBatchSize in
 
 func (e *IndexLookUpExecutor) needPartitionHandle(tp getHandleType) (bool, error) {
 	var col *expression.Column
-	var needPartitionHandle, hasExtraCol bool
+	var needPartitionHandle bool
 	if tp == getHandleFromIndex {
 		cols := e.idxPlans[0].Schema().Columns
 		outputOffsets := e.dagPB.OutputOffsets
 		col = cols[outputOffsets[len(outputOffsets)-1]]
 		// For indexScan, need partitionHandle when global index or keepOrder with partitionTable
 		needPartitionHandle = e.index.Global || e.partitionTableMode && e.keepOrder
-		hasExtraCol = col.ID == model.ExtraPhysTblID || col.ID == model.ExtraPidColID
 	} else {
 		cols := e.tblPlans[0].Schema().Columns
 		outputOffsets := e.tableRequest.OutputOffsets
 		col = cols[outputOffsets[len(outputOffsets)-1]]
 
-		// For TableScan, need partitionHandle in `indexOrder` when e.keepOrder == true
-		needPartitionHandle = (e.index.Global || e.partitionTableMode) && e.keepOrder
-		// no ExtraPidColID here, because TableScan shouldn't contain them.
-		hasExtraCol = col.ID == model.ExtraPhysTblID
+		// For TableScan, need partitionHandle in `indexOrder` when e.keepOrder == true or execute `admin check [table|index]` with global index
+		needPartitionHandle = ((e.index.Global || e.partitionTableMode) && e.keepOrder) || (e.index.Global && e.checkIndexValue != nil)
 	}
+	hasExtraCol := col.ID == model.ExtraPhysTblID
 
-	// TODO: fix global index related bugs later
 	// There will be two needPartitionHandle != hasExtraCol situations.
 	// Only `needPartitionHandle` == true and `hasExtraCol` == false are not allowed.
 	// `ExtraPhysTblID` will be used in `SelectLock` when `needPartitionHandle` == false and `hasExtraCol` == true.
-	if needPartitionHandle && !hasExtraCol && !e.index.Global {
+	if needPartitionHandle && !hasExtraCol {
 		return needPartitionHandle, errors.Errorf("Internal error, needPartitionHandle != ret, tp(%d)", tp)
 	}
 	return needPartitionHandle, nil
@@ -621,7 +622,7 @@ func (e *IndexLookUpExecutor) getRetTpsForIndexReader() []*types.FieldType {
 	var tps []*types.FieldType
 	if len(e.byItems) != 0 {
 		for _, item := range e.byItems {
-			tps = append(tps, item.Expr.GetType())
+			tps = append(tps, item.Expr.GetType(e.Ctx().GetExprCtx().GetEvalCtx()))
 		}
 	}
 	if e.isCommonHandle() {
@@ -651,7 +652,7 @@ func (e *IndexLookUpExecutor) startIndexWorker(ctx context.Context, workCh chan<
 		kvRanges = e.partitionKVRanges
 	}
 	// When len(kvrange) = 1, no sorting is required,
-	// so remove byItems and non-necessary output colums
+	// so remove byItems and non-necessary output columns
 	if len(kvRanges) == 1 {
 		e.dagPB.OutputOffsets = e.dagPB.OutputOffsets[len(e.byItems):]
 		e.byItems = nil
@@ -677,7 +678,6 @@ func (e *IndexLookUpExecutor) startIndexWorker(ctx context.Context, workCh chan<
 			SetStartTS(e.startTS).
 			SetDesc(e.desc).
 			SetKeepOrder(e.keepOrder).
-			SetPaging(e.indexPaging).
 			SetTxnScope(e.txnScope).
 			SetReadReplicaScope(e.readReplicaScope).
 			SetIsStaleness(e.isStaleness).
@@ -687,6 +687,15 @@ func (e *IndexLookUpExecutor) startIndexWorker(ctx context.Context, workCh chan<
 			SetMemTracker(tracker).
 			SetConnIDAndConnAlias(e.Ctx().GetSessionVars().ConnectionID, e.Ctx().GetSessionVars().SessionAlias)
 
+		worker.batchSize = e.calculateBatchSize(initBatchSize, worker.maxBatchSize)
+		if builder.Request.Paging.Enable && builder.Request.Paging.MinPagingSize < uint64(worker.batchSize) {
+			// when paging enabled and Paging.MinPagingSize less than initBatchSize, change Paging.MinPagingSize to
+			// initBatchSize to avoid redundant paging RPC, see more detail in https://github.com/pingcap/tidb/issues/53827
+			builder.Request.Paging.MinPagingSize = uint64(worker.batchSize)
+			if builder.Request.Paging.MaxPagingSize < uint64(worker.batchSize) {
+				builder.Request.Paging.MaxPagingSize = uint64(worker.batchSize)
+			}
+		}
 		results := make([]distsql.SelectResult, 0, len(kvRanges))
 		for _, kvRange := range kvRanges {
 			// check if executor is closed
@@ -717,10 +726,9 @@ func (e *IndexLookUpExecutor) startIndexWorker(ctx context.Context, workCh chan<
 			}
 			results = append(results, result)
 		}
-		worker.batchSize = min(initBatchSize, worker.maxBatchSize)
 		if len(results) > 1 && len(e.byItems) != 0 {
 			// e.Schema() not the output schema for indexReader, and we put byItems related column at first in `buildIndexReq`, so use nil here.
-			ssr := distsql.NewSortedSelectResults(results, nil, e.byItems, e.memTracker)
+			ssr := distsql.NewSortedSelectResults(e.Ctx().GetExprCtx().GetEvalCtx(), results, nil, e.byItems, e.memTracker)
 			results = []distsql.SelectResult{ssr}
 		}
 		ctx1, cancel := context.WithCancel(ctx)
@@ -739,7 +747,36 @@ func (e *IndexLookUpExecutor) startIndexWorker(ctx context.Context, workCh chan<
 	return nil
 }
 
-// startTableWorker launchs some background goroutines which pick tasks from workCh and execute the task.
+// calculateBatchSize calculates a suitable initial batch size.
+func (e *IndexLookUpExecutor) calculateBatchSize(initBatchSize, maxBatchSize int) int {
+	if e.indexPaging {
+		// If indexPaging is true means this query has limit, so use initBatchSize to avoid scan some unnecessary data.
+		return min(initBatchSize, maxBatchSize)
+	}
+	var estRows int
+	if len(e.idxPlans) > 0 {
+		estRows = int(e.idxPlans[0].StatsCount())
+	}
+	return CalculateBatchSize(estRows, initBatchSize, maxBatchSize)
+}
+
+// CalculateBatchSize calculates a suitable initial batch size. It exports for testing.
+func CalculateBatchSize(estRows, initBatchSize, maxBatchSize int) int {
+	batchSize := min(initBatchSize, maxBatchSize)
+	if estRows >= maxBatchSize {
+		return maxBatchSize
+	}
+	for batchSize < estRows {
+		// If batchSize less than estRows, increase batch size to avoid unnecessary rpc.
+		batchSize = batchSize * 2
+		if batchSize >= maxBatchSize {
+			return maxBatchSize
+		}
+	}
+	return batchSize
+}
+
+// startTableWorker launches some background goroutines which pick tasks from workCh and execute the task.
 func (e *IndexLookUpExecutor) startTableWorker(ctx context.Context, workCh <-chan *lookupTableTask) {
 	lookupConcurrencyLimit := e.Ctx().GetSessionVars().IndexLookupConcurrency()
 	e.tblWorkerWg.Add(lookupConcurrencyLimit)
@@ -826,7 +863,6 @@ func (e *IndexLookUpExecutor) Close() error {
 	e.tblWorkerWg.Wait()
 	e.finished = nil
 	e.workerStarted = false
-	e.memTracker = nil
 	e.resultCurr = nil
 	return nil
 }

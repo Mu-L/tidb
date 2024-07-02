@@ -162,7 +162,7 @@ func NewStaticExprContext(opts ...StaticExprCtxOption) *StaticExprContext {
 		staticExprCtxState: staticExprCtxState{
 			charset:                    cs.Name,
 			collation:                  cs.DefaultCollation,
-			defaultCollationForUTF8MB4: variable.DefaultCollationForUTF8MB4,
+			defaultCollationForUTF8MB4: mysql.DefaultCollationName,
 			blockEncryptionMode:        variable.DefBlockEncryptionMode,
 			sysDateIsNow:               variable.DefSysdateIsNow,
 			noopFuncsMode:              variable.TiDBOptOnOffWarn(variable.DefTiDBEnableNoopFuncs),
@@ -265,6 +265,11 @@ func (ctx *StaticExprContext) AllocPlanColumnID() int64 {
 
 // IsInNullRejectCheck implements the `ExprContext.IsInNullRejectCheck` and should always return false.
 func (ctx *StaticExprContext) IsInNullRejectCheck() bool {
+	return false
+}
+
+// IsConstantPropagateCheck implements the `ExprContext.IsConstantPropagateCheck` and should always return false.
+func (ctx *StaticExprContext) IsConstantPropagateCheck() bool {
 	return false
 }
 

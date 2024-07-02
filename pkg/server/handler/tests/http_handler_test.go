@@ -706,7 +706,7 @@ func TestDecodeColumnValue(t *testing.T) {
 	}
 	rd := rowcodec.Encoder{Enable: true}
 	sc := stmtctx.NewStmtCtxWithTimeZone(time.UTC)
-	bs, err := tablecodec.EncodeRow(sc.TimeZone(), row, colIDs, nil, nil, &rd)
+	bs, err := tablecodec.EncodeRow(sc.TimeZone(), row, colIDs, nil, nil, nil, &rd)
 	require.NoError(t, err)
 	require.NotNil(t, bs)
 	bin := base64.StdEncoding.EncodeToString(bs)
@@ -1130,7 +1130,7 @@ func TestWriteDBTablesData(t *testing.T) {
 	// No table in a schema.
 	info := infoschema.MockInfoSchema([]*model.TableInfo{})
 	rc := httptest.NewRecorder()
-	tbs := info.SchemaTables(model.NewCIStr("test"))
+	tbs := info.SchemaTableInfos(model.NewCIStr("test"))
 	require.Equal(t, 0, len(tbs))
 	tikvhandler.WriteDBTablesData(rc, tbs)
 	var ti []*model.TableInfo
@@ -1142,30 +1142,30 @@ func TestWriteDBTablesData(t *testing.T) {
 	// One table in a schema.
 	info = infoschema.MockInfoSchema([]*model.TableInfo{core.MockSignedTable()})
 	rc = httptest.NewRecorder()
-	tbs = info.SchemaTables(model.NewCIStr("test"))
+	tbs = info.SchemaTableInfos(model.NewCIStr("test"))
 	require.Equal(t, 1, len(tbs))
 	tikvhandler.WriteDBTablesData(rc, tbs)
 	decoder = json.NewDecoder(rc.Body)
 	err = decoder.Decode(&ti)
 	require.NoError(t, err)
 	require.Equal(t, 1, len(ti))
-	require.Equal(t, ti[0].ID, tbs[0].Meta().ID)
-	require.Equal(t, ti[0].Name.String(), tbs[0].Meta().Name.String())
+	require.Equal(t, ti[0].ID, tbs[0].ID)
+	require.Equal(t, ti[0].Name.String(), tbs[0].Name.String())
 
 	// Two tables in a schema.
 	info = infoschema.MockInfoSchema([]*model.TableInfo{core.MockSignedTable(), core.MockUnsignedTable()})
 	rc = httptest.NewRecorder()
-	tbs = info.SchemaTables(model.NewCIStr("test"))
+	tbs = info.SchemaTableInfos(model.NewCIStr("test"))
 	require.Equal(t, 2, len(tbs))
 	tikvhandler.WriteDBTablesData(rc, tbs)
 	decoder = json.NewDecoder(rc.Body)
 	err = decoder.Decode(&ti)
 	require.NoError(t, err)
 	require.Equal(t, 2, len(ti))
-	require.Equal(t, ti[0].ID, tbs[0].Meta().ID)
-	require.Equal(t, ti[1].ID, tbs[1].Meta().ID)
-	require.Equal(t, ti[0].Name.String(), tbs[0].Meta().Name.String())
-	require.Equal(t, ti[1].Name.String(), tbs[1].Meta().Name.String())
+	require.Equal(t, ti[0].ID, tbs[0].ID)
+	require.Equal(t, ti[1].ID, tbs[1].ID)
+	require.Equal(t, ti[0].Name.String(), tbs[0].Name.String())
+	require.Equal(t, ti[1].Name.String(), tbs[1].Name.String())
 }
 
 func TestSetLabels(t *testing.T) {

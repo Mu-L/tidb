@@ -29,10 +29,12 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/planner/cardinality"
 	"github.com/pingcap/tidb/pkg/planner/core/base"
+	"github.com/pingcap/tidb/pkg/planner/core/cost"
 	"github.com/pingcap/tidb/pkg/planner/property"
 	"github.com/pingcap/tidb/pkg/planner/util"
 	"github.com/pingcap/tidb/pkg/planner/util/coreusage"
 	"github.com/pingcap/tidb/pkg/planner/util/optimizetrace"
+	"github.com/pingcap/tidb/pkg/planner/util/tablesampler"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/pkg/statistics"
@@ -239,10 +241,10 @@ func setMppOrBatchCopForTableScan(curPlan base.PhysicalPlan) {
 func (sg *TiKVSingleGather) GetPhysicalTableReader(schema *expression.Schema, stats *property.StatsInfo, props ...*property.PhysicalProperty) *PhysicalTableReader {
 	reader := PhysicalTableReader{}.Init(sg.SCtx(), sg.QueryBlockOffset())
 	reader.PlanPartInfo = PhysPlanPartInfo{
-		PruningConds:   sg.Source.allConds,
-		PartitionNames: sg.Source.partitionNames,
+		PruningConds:   sg.Source.AllConds,
+		PartitionNames: sg.Source.PartitionNames,
 		Columns:        sg.Source.TblCols,
-		ColumnNames:    sg.Source.names,
+		ColumnNames:    sg.Source.OutputNames(),
 	}
 	reader.SetStats(stats)
 	reader.SetSchema(schema)
@@ -276,6 +278,19 @@ func (p *PhysicalTableReader) Clone() (base.PhysicalPlan, error) {
 	// TablePlans are actually the flattened plans in tablePlan, so can't copy them, just need to extract from tablePlan
 	cloned.TablePlans = flattenPushDownPlan(cloned.tablePlan)
 	return cloned, nil
+}
+
+// CloneForPlanCache implements Plan.CloneForPlanCache method.
+func (p *PhysicalTableReader) CloneForPlanCache() (base.Plan, bool) {
+	cloned := new(PhysicalTableReader)
+	*cloned = *p
+	t, ok := p.tablePlan.CloneForPlanCache()
+	if !ok {
+		return nil, false
+	}
+	cloned.tablePlan = t.(base.PhysicalPlan)
+	cloned.TablePlans = flattenPushDownPlan(cloned.tablePlan)
+	return cloned, true
 }
 
 // SetChildren overrides op.PhysicalPlan SetChildren interface.
@@ -338,6 +353,19 @@ func (p *PhysicalIndexReader) Clone() (base.PhysicalPlan, error) {
 	}
 	cloned.OutputColumns = util.CloneCols(p.OutputColumns)
 	return cloned, err
+}
+
+// CloneForPlanCache implements Plan.CloneForPlanCache method.
+func (p *PhysicalIndexReader) CloneForPlanCache() (base.Plan, bool) {
+	cloned := new(PhysicalIndexReader)
+	*cloned = *p
+	t, ok := p.indexPlan.CloneForPlanCache()
+	if !ok {
+		return nil, false
+	}
+	cloned.indexPlan = t.(base.PhysicalPlan)
+	cloned.IndexPlans = flattenPushDownPlan(cloned.indexPlan)
+	return cloned, true
 }
 
 // SetSchema overrides op.PhysicalPlan SetSchema interface.
@@ -497,6 +525,25 @@ func (p *PhysicalIndexLookUpReader) Clone() (base.PhysicalPlan, error) {
 	return cloned, nil
 }
 
+// CloneForPlanCache implements Plan.CloneForPlanCache method.
+func (p *PhysicalIndexLookUpReader) CloneForPlanCache() (base.Plan, bool) {
+	cloned := new(PhysicalIndexLookUpReader)
+	*cloned = *p
+	t, ok := p.tablePlan.CloneForPlanCache()
+	if !ok {
+		return nil, false
+	}
+	cloned.tablePlan = t.(base.PhysicalPlan)
+	cloned.TablePlans = flattenPushDownPlan(t.(base.PhysicalPlan))
+	i, ok := p.indexPlan.CloneForPlanCache()
+	if !ok {
+		return nil, false
+	}
+	cloned.indexPlan = i.(base.PhysicalPlan)
+	cloned.IndexPlans = flattenPushDownPlan(i.(base.PhysicalPlan))
+	return cloned, true
+}
+
 // ExtractCorrelatedCols implements op.PhysicalPlan interface.
 func (p *PhysicalIndexLookUpReader) ExtractCorrelatedCols() (corCols []*expression.CorrelatedColumn) {
 	for _, child := range p.TablePlans {
@@ -604,7 +651,7 @@ type PhysicalIndexMergeReader struct {
 
 	KeepOrder bool
 
-	HandleCols HandleCols
+	HandleCols util.HandleCols
 }
 
 // GetAvgTableRowSize return the average row size of table plan.
@@ -708,7 +755,7 @@ type PhysicalIndexScan struct {
 	// The index scan may be on a partition.
 	physicalTableID int64
 
-	GenExprs map[model.TableItemID]expression.Expression
+	GenExprs map[model.TableItemID]expression.Expression `json:"-"`
 
 	isPartition bool
 	Desc        bool
@@ -764,6 +811,14 @@ func (p *PhysicalIndexScan) Clone() (base.PhysicalPlan, error) {
 	}
 
 	return cloned, nil
+}
+
+// CloneForPlanCache implements op.CloneForPlanCache interface.
+func (p *PhysicalIndexScan) CloneForPlanCache() (base.Plan, bool) {
+	cloned := new(PhysicalIndexScan)
+	*cloned = *p
+	cloned.Ranges = util.CloneRanges(p.Ranges)
+	return cloned, true
 }
 
 // ExtractCorrelatedCols implements op.PhysicalPlan interface.
@@ -839,7 +894,7 @@ type PhysicalMemTable struct {
 	Table          *model.TableInfo
 	Columns        []*model.ColumnInfo
 	Extractor      base.MemTablePredicateExtractor
-	QueryTimeRange QueryTimeRange
+	QueryTimeRange util.QueryTimeRange
 }
 
 // MemoryUsage return the memory usage of PhysicalMemTable
@@ -878,7 +933,7 @@ type PhysicalTableScan struct {
 
 	// HandleIdx is the index of handle, which is only used for admin check table.
 	HandleIdx  []int
-	HandleCols HandleCols
+	HandleCols util.HandleCols
 
 	StoreType kv.StoreType
 
@@ -898,7 +953,7 @@ type PhysicalTableScan struct {
 
 	PlanPartInfo PhysPlanPartInfo
 
-	SampleInfo *TableSampleInfo
+	SampleInfo *tablesampler.TableSampleInfo
 
 	// required by cost model
 	// tblCols and tblColHists contains all columns before pruning, which are used to calculate row-size
@@ -945,6 +1000,14 @@ func (ts *PhysicalTableScan) Clone() (base.PhysicalPlan, error) {
 		clonedScan.runtimeFilterList[i] = clonedRF
 	}
 	return clonedScan, nil
+}
+
+// CloneForPlanCache implements op.CloneForPlanCache interface.
+func (ts *PhysicalTableScan) CloneForPlanCache() (base.Plan, bool) {
+	cloned := new(PhysicalTableScan)
+	*cloned = *ts
+	cloned.Ranges = util.CloneRanges(ts.Ranges)
+	return cloned, true
 }
 
 // ExtractCorrelatedCols implements op.PhysicalPlan interface.
@@ -1095,6 +1158,15 @@ func (p *PhysicalProjection) Clone() (base.PhysicalPlan, error) {
 	cloned.physicalSchemaProducer = *base
 	cloned.Exprs = util.CloneExprs(p.Exprs)
 	return cloned, err
+}
+
+// CloneForPlanCache implements op.CloneForPlanCache interface.
+func (p *PhysicalProjection) CloneForPlanCache() (base.Plan, bool) {
+	cloned := new(PhysicalProjection)
+	*cloned = *p
+	var ok bool
+	cloned.children, ok = clonePhysicalPlansForPlanCache(p.children)
+	return cloned, ok
 }
 
 // ExtractCorrelatedCols implements op.PhysicalPlan interface.
@@ -1363,6 +1435,30 @@ type PhysicalHashJoin struct {
 
 	// for runtime filter
 	runtimeFilterList []*RuntimeFilter
+}
+
+// CanUseHashJoinV2 returns true if current join is supported by hash join v2
+func (p *PhysicalHashJoin) CanUseHashJoinV2() bool {
+	switch p.JoinType {
+	case LeftOuterJoin, InnerJoin:
+		// null aware join is not supported yet
+		if len(p.LeftNAJoinKeys) > 0 {
+			return false
+		}
+		// cross join is not supported
+		if len(p.LeftJoinKeys) == 0 {
+			return false
+		}
+		// NullEQ is not supported yet
+		for _, value := range p.IsNullEQ {
+			if value {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
 }
 
 // Clone implements op.PhysicalPlan interface.
@@ -1760,7 +1856,7 @@ type PhysicalLock struct {
 
 	Lock *ast.SelectLockInfo
 
-	TblID2Handle       map[int64][]HandleCols
+	TblID2Handle       map[int64][]util.HandleCols
 	TblID2PhysTblIDCol map[int64]*expression.Column
 }
 
@@ -1914,10 +2010,10 @@ func (p *basePhysicalAgg) numDistinctFunc() (num int) {
 func (p *basePhysicalAgg) getAggFuncCostFactor(isMPP bool) (factor float64) {
 	factor = 0.0
 	for _, agg := range p.AggFuncs {
-		if fac, ok := aggFuncFactor[agg.Name]; ok {
+		if fac, ok := cost.AggFuncFactor[agg.Name]; ok {
 			factor += fac
 		} else {
-			factor += aggFuncFactor["default"]
+			factor += cost.AggFuncFactor["default"]
 		}
 	}
 	if factor == 0 {
@@ -1926,7 +2022,7 @@ func (p *basePhysicalAgg) getAggFuncCostFactor(isMPP bool) (factor float64) {
 			// But in mpp cases, 2-phase is more usual. So we change this factor.
 			// TODO: This is still a little tricky and might cause regression. We should
 			// calibrate these factors and polish our cost model in the future.
-			factor = aggFuncFactor[ast.AggFuncFirstRow]
+			factor = cost.AggFuncFactor[ast.AggFuncFirstRow]
 		} else {
 			factor = 1.0
 		}
@@ -2125,7 +2221,7 @@ type PhysicalUnionScan struct {
 
 	Conditions []expression.Expression
 
-	HandleCols HandleCols
+	HandleCols util.HandleCols
 }
 
 // ExtractCorrelatedCols implements op.PhysicalPlan interface.
@@ -2195,6 +2291,15 @@ func (p *PhysicalSelection) Clone() (base.PhysicalPlan, error) {
 	cloned.basePhysicalPlan = *base
 	cloned.Conditions = util.CloneExprs(p.Conditions)
 	return cloned, nil
+}
+
+// CloneForPlanCache implements base.Plan.CloneForPlanCache method.
+func (p *PhysicalSelection) CloneForPlanCache() (base.Plan, bool) {
+	cloned := new(PhysicalSelection)
+	*cloned = *p
+	var ok bool
+	cloned.children, ok = clonePhysicalPlansForPlanCache(p.children)
+	return cloned, ok
 }
 
 // ExtractCorrelatedCols implements op.PhysicalPlan interface.
@@ -2525,45 +2630,10 @@ func SafeClone(v base.PhysicalPlan) (_ base.PhysicalPlan, err error) {
 // It returns the sample rows to its parent operand.
 type PhysicalTableSample struct {
 	physicalSchemaProducer
-	TableSampleInfo *TableSampleInfo
+	TableSampleInfo *tablesampler.TableSampleInfo
 	TableInfo       table.Table
 	PhysicalTableID int64
 	Desc            bool
-}
-
-// TableSampleInfo contains the information for PhysicalTableSample.
-type TableSampleInfo struct {
-	AstNode    *ast.TableSample
-	FullSchema *expression.Schema
-	Partitions []table.PartitionedTable
-}
-
-// MemoryUsage return the memory usage of TableSampleInfo
-func (t *TableSampleInfo) MemoryUsage() (sum int64) {
-	if t == nil {
-		return
-	}
-
-	sum = size.SizeOfPointer*2 + size.SizeOfSlice + int64(cap(t.Partitions))*size.SizeOfInterface
-	if t.AstNode != nil {
-		sum += int64(unsafe.Sizeof(ast.TableSample{}))
-	}
-	if t.FullSchema != nil {
-		sum += t.FullSchema.MemoryUsage()
-	}
-	return
-}
-
-// NewTableSampleInfo creates a new TableSampleInfo.
-func NewTableSampleInfo(node *ast.TableSample, fullSchema *expression.Schema, pt []table.PartitionedTable) *TableSampleInfo {
-	if node == nil {
-		return nil
-	}
-	return &TableSampleInfo{
-		AstNode:    node,
-		FullSchema: fullSchema.Clone(),
-		Partitions: pt,
-	}
 }
 
 // PhysicalCTE is for CTE.
@@ -2828,4 +2898,16 @@ func (p *PhysicalSequence) Clone() (base.PhysicalPlan, error) {
 // Schema returns its last child(which is the main query tree)'s schema.
 func (p *PhysicalSequence) Schema() *expression.Schema {
 	return p.Children()[len(p.Children())-1].Schema()
+}
+
+func clonePhysicalPlansForPlanCache(plans []base.PhysicalPlan) ([]base.PhysicalPlan, bool) {
+	cloned := make([]base.PhysicalPlan, 0, len(plans))
+	for _, p := range plans {
+		clonedP, ok := p.CloneForPlanCache()
+		if !ok {
+			return nil, false
+		}
+		cloned = append(cloned, clonedP.(base.PhysicalPlan))
+	}
+	return cloned, true
 }

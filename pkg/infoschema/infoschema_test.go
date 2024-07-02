@@ -953,20 +953,21 @@ func TestEnableInfoSchemaV2(t *testing.T) {
 	// Test the @@tidb_enable_infoschema_v2 variable.
 	tk.MustQuery("select @@tidb_schema_cache_size").Check(testkit.Rows("0"))
 	tk.MustQuery("select @@global.tidb_schema_cache_size").Check(testkit.Rows("0"))
-	require.Equal(t, variable.SchemaCacheSize.Load(), int64(0))
+	require.Equal(t, variable.SchemaCacheSize.Load(), uint64(0))
 
 	// Modify it.
-	tk.MustExec("set @@global.tidb_schema_cache_size = 1024")
-	tk.MustQuery("select @@global.tidb_schema_cache_size").Check(testkit.Rows("1024"))
-	tk.MustQuery("select @@tidb_schema_cache_size").Check(testkit.Rows("1024"))
-	require.Equal(t, variable.SchemaCacheSize.Load(), int64(1024))
+	tk.MustExec("set @@global.tidb_schema_cache_size = 1073741824")
+	tk.MustQuery("select @@global.tidb_schema_cache_size").Check(testkit.Rows("1073741824"))
+	tk.MustQuery("select @@tidb_schema_cache_size").Check(testkit.Rows("1073741824"))
+	require.Equal(t, variable.SchemaCacheSize.Load(), uint64(1073741824))
 
 	tk.MustExec("use test")
 	tk.MustExec("create table v2 (id int)")
 
 	// Check the InfoSchema used is V2.
 	is := domain.GetDomain(tk.Session()).InfoSchema()
-	require.True(t, infoschema.IsV2(is))
+	isV2, _ := infoschema.IsV2(is)
+	require.True(t, isV2)
 
 	// Execute some basic operations under infoschema v2.
 	tk.MustQuery("show tables").Check(testkit.Rows("v2"))
@@ -981,11 +982,12 @@ func TestEnableInfoSchemaV2(t *testing.T) {
 	// Change infoschema back to v1 and check again.
 	tk.MustExec("set @@global.tidb_schema_cache_size = 0")
 	tk.MustQuery("select @@global.tidb_schema_cache_size").Check(testkit.Rows("0"))
-	require.Equal(t, variable.SchemaCacheSize.Load(), int64(0))
+	require.Equal(t, variable.SchemaCacheSize.Load(), uint64(0))
 
 	tk.MustExec("drop table v1")
 	is = domain.GetDomain(tk.Session()).InfoSchema()
-	require.False(t, infoschema.IsV2(is))
+	isV2, _ = infoschema.IsV2(is)
+	require.False(t, isV2)
 }
 
 type infoschemaTestContext struct {

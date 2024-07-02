@@ -32,6 +32,7 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/parser/terror"
 	planctx "github.com/pingcap/tidb/pkg/planner/context"
+	"github.com/pingcap/tidb/pkg/session/cursor"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/sessionstates"
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
@@ -70,7 +71,7 @@ type Context struct {
 	sessionVars   *variable.SessionVars
 	tblctx        *tbctximpl.TableContextImpl
 	cancel        context.CancelFunc
-	pcache        sessionctx.PlanCache
+	pcache        sessionctx.SessionPlanCache
 	level         kvrpcpb.DiskFullOpt
 	inSandBoxMode bool
 	isDDLOwner    bool
@@ -250,7 +251,7 @@ func (c *Context) GetDistSQLCtx() *distsqlctx.DistSQLContext {
 	sc := vars.StmtCtx
 
 	return &distsqlctx.DistSQLContext{
-		AppendWarning:                        sc.AppendWarning,
+		WarnHandler:                          sc.WarnHandler,
 		InRestrictedSQL:                      sc.InRestrictedSQL,
 		Client:                               c.GetClient(),
 		EnabledRateLimitAction:               vars.EnabledRateLimitAction,
@@ -303,10 +304,10 @@ func (c *Context) GetBuildPBCtx() *planctx.BuildPBContext {
 		// the following fields are used to build `expression.PushDownContext`.
 		// TODO: it'd be better to embed `expression.PushDownContext` in `BuildPBContext`. But `expression` already
 		// depends on this package, so we need to move `expression.PushDownContext` to a standalone package first.
-		GroupConcatMaxLen:  c.GetSessionVars().GroupConcatMaxLen,
-		InExplainStmt:      c.GetSessionVars().StmtCtx.InExplainStmt,
-		AppendWarning:      c.GetSessionVars().StmtCtx.AppendWarning,
-		AppendExtraWarning: c.GetSessionVars().StmtCtx.AppendExtraWarning,
+		GroupConcatMaxLen: c.GetSessionVars().GroupConcatMaxLen,
+		InExplainStmt:     c.GetSessionVars().StmtCtx.InExplainStmt,
+		WarnHandler:       c.GetSessionVars().StmtCtx.WarnHandler,
+		ExtraWarnghandler: c.GetSessionVars().StmtCtx.ExtraWarnHandler,
 	}
 }
 
@@ -384,7 +385,7 @@ func (*Context) SetGlobalSysVar(_ sessionctx.Context, name string, value string)
 }
 
 // GetSessionPlanCache implements the sessionctx.Context interface.
-func (c *Context) GetSessionPlanCache() sessionctx.PlanCache {
+func (c *Context) GetSessionPlanCache() sessionctx.SessionPlanCache {
 	return c.pcache
 }
 
@@ -604,6 +605,11 @@ func (*Context) Close() {}
 
 // NewStmtIndexUsageCollector implements the sessionctx.Context interface
 func (*Context) NewStmtIndexUsageCollector() *indexusage.StmtIndexUsageCollector {
+	return nil
+}
+
+// GetCursorTracker implements the sessionctx.Context interface
+func (*Context) GetCursorTracker() cursor.Tracker {
 	return nil
 }
 

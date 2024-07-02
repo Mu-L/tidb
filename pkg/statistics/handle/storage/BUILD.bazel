@@ -15,6 +15,7 @@ go_library(
     deps = [
         "//pkg/config",
         "//pkg/infoschema",
+        "//pkg/kv",
         "//pkg/parser/ast",
         "//pkg/parser/model",
         "//pkg/parser/mysql",
@@ -22,6 +23,7 @@ go_library(
         "//pkg/sessionctx",
         "//pkg/sessionctx/variable",
         "//pkg/statistics",
+        "//pkg/statistics/asyncload",
         "//pkg/statistics/handle/cache",
         "//pkg/statistics/handle/lockstats",
         "//pkg/statistics/handle/logutil",

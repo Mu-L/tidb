@@ -82,13 +82,6 @@ func canProjectionBeEliminatedStrict(p *PhysicalProjection) bool {
 	if p.Schema().Len() != child.Schema().Len() {
 		return false
 	}
-	for _, ref := range p.SCtx().GetSessionVars().StmtCtx.ColRefFromUpdatePlan {
-		for _, one := range p.Schema().Columns {
-			if ref == one.UniqueID {
-				return false
-			}
-		}
-	}
 	for i, expr := range p.Exprs {
 		col, ok := expr.(*expression.Column)
 		if !ok || !col.EqualColumn(child.Schema().Columns[i]) {
@@ -146,6 +139,11 @@ func doPhysicalProjectionElimination(p base.PhysicalPlan) base.PhysicalPlan {
 			childProj.SetSchema(p.Schema())
 		}
 	}
+	for i, col := range p.Schema().Columns {
+		if p.SCtx().GetSessionVars().StmtCtx.ColRefFromUpdatePlan.Has(int(col.UniqueID)) && !child.Schema().Columns[i].Equal(nil, col) {
+			return p
+		}
+	}
 	return child
 }
 
@@ -201,9 +199,9 @@ func (pe *projectionEliminator) eliminate(p base.LogicalPlan, replace map[string
 	// replace logical plan schema
 	switch x := p.(type) {
 	case *LogicalJoin:
-		x.schema = buildLogicalJoinSchema(x.JoinType, x)
+		x.SetSchema(buildLogicalJoinSchema(x.JoinType, x))
 	case *LogicalApply:
-		x.schema = buildLogicalJoinSchema(x.JoinType, x)
+		x.SetSchema(buildLogicalJoinSchema(x.JoinType, x))
 	default:
 		for _, dst := range p.Schema().Columns {
 			resolveColumnAndReplace(dst, replace)
@@ -214,13 +212,13 @@ func (pe *projectionEliminator) eliminate(p base.LogicalPlan, replace map[string
 
 	// eliminate duplicate projection: projection with child projection
 	if isProj {
-		if child, ok := p.Children()[0].(*LogicalProjection); ok && !ExprsHasSideEffects(child.Exprs) {
+		if child, ok := p.Children()[0].(*LogicalProjection); ok && !expression.ExprsHasSideEffects(child.Exprs) {
 			ctx := p.SCtx()
 			for i := range proj.Exprs {
 				proj.Exprs[i] = ReplaceColumnOfExpr(proj.Exprs[i], child, child.Schema())
 				foldedExpr := expression.FoldConstant(ctx.GetExprCtx(), proj.Exprs[i])
 				// the folded expr should have the same null flag with the original expr, especially for the projection under union, so forcing it here.
-				foldedExpr.GetType().SetFlag((foldedExpr.GetType().GetFlag() & ^mysql.NotNullFlag) | (proj.Exprs[i].GetType().GetFlag() & mysql.NotNullFlag))
+				foldedExpr.GetType(ctx.GetExprCtx().GetEvalCtx()).SetFlag((foldedExpr.GetType(ctx.GetExprCtx().GetEvalCtx()).GetFlag() & ^mysql.NotNullFlag) | (proj.Exprs[i].GetType(ctx.GetExprCtx().GetEvalCtx()).GetFlag() & mysql.NotNullFlag))
 				proj.Exprs[i] = foldedExpr
 			}
 			p.Children()[0] = child.Children()[0]
@@ -279,21 +277,6 @@ func (p *LogicalProjection) ReplaceExprColumns(replace map[string]*expression.Co
 }
 
 // ReplaceExprColumns implements base.LogicalPlan interface.
-func (la *LogicalAggregation) ReplaceExprColumns(replace map[string]*expression.Column) {
-	for _, agg := range la.AggFuncs {
-		for _, aggExpr := range agg.Args {
-			ResolveExprAndReplace(aggExpr, replace)
-		}
-		for _, orderExpr := range agg.OrderByItems {
-			ResolveExprAndReplace(orderExpr.Expr, replace)
-		}
-	}
-	for _, gbyItem := range la.GroupByItems {
-		ResolveExprAndReplace(gbyItem, replace)
-	}
-}
-
-// ReplaceExprColumns implements base.LogicalPlan interface.
 func (p *LogicalSelection) ReplaceExprColumns(replace map[string]*expression.Column) {
 	for _, expr := range p.Conditions {
 		ResolveExprAndReplace(expr, replace)
@@ -308,20 +291,6 @@ func (la *LogicalApply) ReplaceExprColumns(replace map[string]*expression.Column
 		if dst != nil {
 			coCol.Column = *dst
 		}
-	}
-}
-
-// ReplaceExprColumns implements base.LogicalPlan interface.
-func (ls *LogicalSort) ReplaceExprColumns(replace map[string]*expression.Column) {
-	for _, byItem := range ls.ByItems {
-		ResolveExprAndReplace(byItem.Expr, replace)
-	}
-}
-
-// ReplaceExprColumns implements base.LogicalPlan interface.
-func (lt *LogicalTopN) ReplaceExprColumns(replace map[string]*expression.Column) {
-	for _, byItem := range lt.ByItems {
-		ResolveExprAndReplace(byItem.Expr, replace)
 	}
 }
 
